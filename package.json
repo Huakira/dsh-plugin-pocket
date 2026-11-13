@@ -1,5 +1,5 @@
 {
-  "name": "@huakira/plugin-pocket",
+  "name": "@huakirax/plugin-pocket",
   "version": "0.1.0",
   "description": "Bridge plugin for the dsh-android native app: a small authenticated JSON/WebSocket protocol over DeepSeek Harness sessions",
   "keywords": [
