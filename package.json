@@ -1,0 +1,85 @@
+{
+  "name": "dsh-plugin-pocket",
+  "version": "0.1.0",
+  "description": "Bridge plugin for the dsh-android native app: a small authenticated JSON/WebSocket protocol over DeepSeek Harness sessions",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "android",
+    "remote"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Huakira/dsh-plugin-pocket.git"
+  },
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "dsh-pocket": "bin/pocket.js"
+  },
+  "files": [
+    "index.js",
+    "src",
+    "lib",
+    "bin",
+    "cordis.patch.yml",
+    "README.md",
+    "iroh"
+  ],
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "scripts": {
+    "build:client": "tsdown",
+    "build:iroh": "cargo build --release -p pocket-host --manifest-path iroh/Cargo.toml",
+    "pretest": "npm run build:client",
+    "lint": "eslint .",
+    "test": "node --test --test-timeout=60000 test/*.test.js",
+    "test:integration": "npm run build:client && node --test test/integration/*.test.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "dependencies": {
+    "bonjour-service": "1.4.4",
+    "fflate": "^0.8.3",
+    "ws": "^8.18.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-api-session-controller": ">=0.2.1-alpha.2 <0.2.3-0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-api-session-controller": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@eslint/js": "^9.14.0",
+    "@types/react": "~18.3.1",
+    "@types/react-dom": "~18.3.0",
+    "eslint": "^9.14.0",
+    "globals": "^15.12.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "tsdown": "^0.15.0",
+    "typescript": "^5.6.0",
+    "uqr": "^0.1.3"
+  }
+}

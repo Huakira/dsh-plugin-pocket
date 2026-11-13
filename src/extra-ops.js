@@ -1,0 +1,604 @@
+import { randomUUID } from 'node:crypto'
+
+const str = (v) => typeof v === 'string' && v.length > 0
+const bad = (m) => Object.assign(new Error(m), { code: 'bad-request' })
+
+/** Session object of a live (or auto-resumed) Agent. */
+function sessionOf(agents, sessionId) {
+  if (!str(sessionId)) throw bad('sessionId required')
+  const agent = agents.get(sessionId)
+  if (!agent) throw Object.assign(new Error('session has no live agent'), { code: 'session/not-found' })
+  return agent.session
+}
+
+/** Live Agent for terminal / command ops that need the Gateway Agent handle. */
+function agentOf(agents, sessionId) {
+  if (!str(sessionId)) throw bad('sessionId required')
+  const agent = agents.get(sessionId)
+  if (!agent) throw Object.assign(new Error('session has no live agent'), { code: 'session/not-found' })
+  return agent
+}
+
+/** permissions.* over the in-process permissionPresets service. */
+export function permissionOps(presets, agents) {
+  return {
+    'permissions.catalog': () => presets.catalog(),
+    'permissions.get': (a) => ({ current: presets.current(sessionOf(agents, a.sessionId)) }),
+    'permissions.set': (a) => {
+      if (!str(a.name)) throw bad('name required')
+      const session = sessionOf(agents, a.sessionId)
+      presets.set(session, a.name)
+      return { current: presets.current(session) }
+    },
+  }
+}
+
+/** presets.list over the agentPresets registry (same roster the web UI uses). */
+export function presetOps(agentPresets, settingsController) {
+  return {
+    'presets.list': () => agentPresets.remoteExportList(),
+    ...(typeof agentPresets.readDocument === 'function' ? {
+      'presets.read': (a) => {
+        if (!str(a.id)) throw bad('preset id required')
+        return agentPresets.readDocument(a.id)
+      },
+    } : {}),
+    ...(settingsController?.describe ? {
+      'presets.settings': async () => {
+        const described = await settingsController.describe()
+        return {
+          ...await agentPresets.remoteExportList(),
+          writable: described.writable !== false && typeof settingsController?.mutate === 'function',
+          namespace: described.namespaces.find((ns) => ns.ns === 'agent-preset-registry'),
+        }
+      },
+    } : {}),
+  }
+}
+
+/**
+ * Standing scope of the default agent preset — the same key desktop uses to
+ * read a new-conversation catalog before a Session exists.
+ * Prefer `acquireScope()` (SessionSkillCatalog's Host lease); `standingKeyFor()`
+ * is the same preset package's older name for that key.
+ */
+async function defaultProfileScope(agentPresets) {
+  if (typeof agentPresets?.acquireScope === 'function') return agentPresets.acquireScope()
+  if (typeof agentPresets?.standingKeyFor === 'function') {
+    return { key: await agentPresets.standingKeyFor() }
+  }
+  throw Object.assign(new Error('default agent profile is unavailable'), { code: 'unavailable' })
+}
+
+async function withDefaultProfileScope(agentPresets, fn) {
+  const lease = await defaultProfileScope(agentPresets)
+  try {
+    return await fn(lease.key)
+  } finally {
+    await lease?.[Symbol.asyncDispose]?.()
+  }
+}
+
+/**
+ * Map a Host `SkillSummary` to the pocket `skills.list` entry SessionSkillCatalog
+ * returns. Invocation policy is required; user-only filtering matches desktop.
+ */
+function userInvocableSkillEntry(skill) {
+  const invocation = skill?.invocation
+  if (!invocation || typeof invocation.userInvocable !== 'boolean'
+    || typeof invocation.modelInvocable !== 'boolean') {
+    throw Object.assign(new Error('skill catalog entry is missing invocation policy'), { code: 'internal' })
+  }
+  if (!invocation.userInvocable) return undefined
+  if (!str(skill.name)) throw Object.assign(new Error('skill catalog entry is missing name'), { code: 'internal' })
+  if (typeof skill.description !== 'string') {
+    throw Object.assign(new Error('skill catalog entry is missing description'), { code: 'internal' })
+  }
+  return {
+    name: skill.name,
+    ...skill.path === undefined ? {} : { path: skill.path },
+    description: skill.description,
+    ...skill.whenToUse === undefined ? {} : { whenToUse: skill.whenToUse },
+    modelInvocable: invocation.modelInvocable,
+  }
+}
+
+/** New-conversation skill catalog: default workspace cwd + default preset scope. */
+async function listDefaultSkills({ skills, workingDirectory, agentPresets }, signal) {
+  const cwd = workingDirectory?.defaultDirectory
+  if (!str(cwd)) throw Object.assign(new Error('default workspace is unavailable'), { code: 'unavailable' })
+  if (typeof skills?.list !== 'function') {
+    throw Object.assign(new Error('skill registry is absent'), { code: 'unavailable' })
+  }
+  return withDefaultProfileScope(agentPresets, async (scope) => {
+    const listed = await skills.list({ cwd, scope, ...(signal === undefined ? {} : { signal }) })
+    if (!Array.isArray(listed)) {
+      throw Object.assign(new Error('skill registry list did not return an array'), { code: 'internal' })
+    }
+    return { skills: listed.map(userInvocableSkillEntry).filter((entry) => entry !== undefined) }
+  })
+}
+
+/**
+ * Slash commands (`/compact`, `/plan`, `/goal …`, `/feedback …`) via Host commands service.
+ * Line may be with or without a leading `/`.
+ *
+ * `commands.list` without `sessionId` uses the default preset standing scope —
+ * the same composition desktop shows on a new conversation.
+ */
+export function commandOps(commands, agents, agentPresets) {
+  return {
+    'commands.list': async (a) => {
+      if (str(a.sessionId)) return { commands: commands.list(agentOf(agents, a.sessionId)) }
+      return { commands: await withDefaultProfileScope(agentPresets, (scope) => commands.list(scope)) }
+    },
+    'commands.execute': async (a, signal) => {
+      if (!str(a.sessionId) || !str(a.line)) throw bad('sessionId and line required')
+      const agent = agents.get(a.sessionId)
+      if (!agent) throw Object.assign(new Error('session has no live agent'), { code: 'session/not-found' })
+      const line = a.line.trimStart().startsWith('/') ? a.line.trim() : `/${a.line.trim()}`
+      const execution = await commands.execute(agent, line, Array.isArray(a.attachments) ? a.attachments : [], signal)
+      if (execution === undefined) throw Object.assign(new Error(`unknown command: ${line}`), { code: 'command/unknown' })
+      return { commandId: execution.commandId, result: execution.result }
+    },
+  }
+}
+
+/**
+ * User-invocable skill catalog for the `/` menu.
+ * With `sessionId`, forwards Host `sessionSkillCatalog.list` — the same
+ * `skills/list` Remote desktop `ui-skill` calls — as `{ skills: [...] }`.
+ * Without `sessionId`, lists through the Host skill registry with the default
+ * workspace cwd and default preset standing scope (desktop new conversation).
+ */
+export function skillOps(sessionSkillCatalog, host = {}) {
+  return {
+    'skills.list': async (a, signal) => {
+      if (str(a.sessionId)) return sessionSkillCatalog.list({ sessionId: a.sessionId }, signal)
+      return listDefaultSkills(host, signal)
+    },
+  }
+}
+
+/**
+ * Read-only workspace file browse for the phone right panel.
+ * Scope is built from the live (or persisted) session header cwd.
+ */
+export function filesOps(workspaceFiles, sessions, sandboxPolicy) {
+  const scopeOf = async (sessionId) => {
+    if (!str(sessionId)) throw bad('sessionId required')
+    const live = sessions.get?.(sessionId)?.header
+    const workspaceRoot = live?.cwd ?? sandboxPolicy?.workspaceRoot
+    if (!str(workspaceRoot)) throw Object.assign(new Error('session has no workspace root'), { code: 'session/not-found' })
+    return { sessionId, workspaceRoot }
+  }
+  return {
+    'files.list': async (a, signal) => {
+      const scope = await scopeOf(a.sessionId)
+      return workspaceFiles.list(scope, str(a.path) ? a.path : '.', signal)
+    },
+    ...(typeof workspaceFiles.changes === 'function' ? {
+      'files.follow': (a, _signal, client) => {
+        if (!str(a.sessionId) || !/^f-[a-zA-Z0-9-]{1,80}$/.test(a.subId ?? '')) throw bad('sessionId and file subscription id required')
+        const path = str(a.path) ? a.path : '.'
+        if (path.startsWith('/') || path.includes('\\') || path.includes('\0') ||
+            path.split('/').includes('..') || /^[a-z][a-z\d+.-]*:/iu.test(path)) {
+          throw Object.assign(new Error('directory must be inside the workspace'), { code: 'workspace-file/outside-workspace' })
+        }
+        if (!client?.subs || typeof client.push !== 'function') throw bad('live client required')
+        const subId = a.subId
+        if (client.subs.has(subId)) throw bad('subscription already exists')
+        const ac = new AbortController()
+        // Register before any await: cancellation before the reply can still unfollow.
+        client.subs.set(subId, ac)
+        void (async () => {
+          try {
+            const scope = await scopeOf(a.sessionId)
+            ac.signal.throwIfAborted()
+            // The directory API owns canonical containment, including symlinks.
+            const listed = await workspaceFiles.list(scope, path, ac.signal)
+            ac.signal.throwIfAborted()
+            for await (const frame of workspaceFiles.changes(scope, listed.path || '.', ac.signal)) {
+              if (ac.signal.aborted) break
+              client.push({ ev: 'files', subId, frame: { ...frame, path: listed.path || '.' } })
+            }
+            if (!ac.signal.aborted) client.push({ ev: 'files.end', subId })
+          } catch (error) {
+            if (!ac.signal.aborted) client.push({
+              ev: 'files.error', subId,
+              error: { code: error?.code ?? 'internal', message: String(error?.message ?? error) },
+            })
+          } finally {
+            ac.abort()
+            if (client.subs.get(subId) === ac) client.subs.delete(subId)
+          }
+        })()
+        return { subId }
+      },
+    } : {}),
+    'files.read': async (a, signal) => {
+      if (!str(a.path)) throw bad('path required')
+      const scope = await scopeOf(a.sessionId)
+      return workspaceFiles.read(scope, a.path, a.range, signal)
+    },
+    /**
+     * Binary preview for images / PDF. Host `readBytes` returns a Uint8Array;
+     * JSON transport base64-encodes it as `{encoding:'base64', data}`.
+     */
+    'files.readBytes': async (a, signal) => {
+      if (!str(a.path)) throw bad('path required')
+      const scope = await scopeOf(a.sessionId)
+      const options = a.options && typeof a.options === 'object' ? a.options : undefined
+      const r = await workspaceFiles.readBytes(scope, a.path, options, signal)
+      const raw = r?.data
+      const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw ?? [])
+      return {
+        absolutePath: r.absolutePath,
+        version: r.version,
+        bytes: r.bytes,
+        offset: r.offset,
+        eof: r.eof,
+        encoding: 'base64',
+        data: buf.toString('base64'),
+      }
+    },
+  }
+}
+
+/**
+ * In-process Client→Host uplink for `TerminalController.attach`.
+ * Desktop attach is a duplex RemoteStream: Host reads `ctx.invocation.uplink()`.
+ */
+function createTerminalUplink() {
+  const pending = []
+  let notify
+  let closed = false
+  const wake = () => {
+    const resolve = notify
+    notify = undefined
+    resolve?.()
+  }
+  const iterator = {
+    async next() {
+      while (!closed && pending.length === 0) {
+        await new Promise((resolve) => { notify = resolve })
+      }
+      if (pending.length > 0) return { done: false, value: pending.shift() }
+      return { done: true, value: undefined }
+    },
+    async return() {
+      closed = true
+      wake()
+      return { done: true, value: undefined }
+    },
+    [Symbol.asyncIterator]() { return this },
+  }
+  return {
+    [Symbol.asyncIterator]() { return iterator },
+    push(item) {
+      if (closed) {
+        throw Object.assign(new Error('terminal attachment is closed'), { code: 'terminal/unavailable' })
+      }
+      pending.push(item)
+      wake()
+    },
+    close() {
+      closed = true
+      wake()
+    },
+  }
+}
+
+/**
+ * Bind the in-process uplink the same way Typert Gateway binds `ctx.invocation`:
+ * Gateway calls `receiverContext.extend({ invocation }).get(service)`, so the
+ * method reads `this.ctx.invocation` from a call-derived child Context.
+ *
+ * Never assign `ctx.invocation` directly: typert-protocol registers it on the
+ * root as a get-only Cordis accessor, so the Context proxy's set trap returns
+ * false and strict-mode code throws
+ * "'set' on proxy: trap returned falsish for property 'invocation'".
+ */
+function attachWithUplink(controller, agent, id, signal, uplink) {
+  const ctx = controller.ctx
+  if (ctx === undefined || typeof ctx.extend !== 'function') {
+    throw Object.assign(new Error('terminalController.ctx is required for attach'), { code: 'internal' })
+  }
+  const invocation = { uplink: () => uplink, uplinkWindow: undefined }
+  const bound = ctx.extend({ invocation }).get('terminalController')
+  if (bound === undefined || typeof bound.attach !== 'function') {
+    throw Object.assign(new Error('terminalController is unavailable for attach'), { code: 'terminal/unavailable' })
+  }
+  return bound.attach(agent, id, signal)
+}
+
+/**
+ * Desktop window hold: `retain(sessionId, id, signal)` yields `{type:'retained'}`
+ * then stays open until cancellation. Attach waits for that acknowledgement.
+ */
+function startRetain(controller, sessionId, id, signal) {
+  const ready = Promise.withResolvers()
+  const done = (async () => {
+    try {
+      let acknowledged = false
+      for await (const frame of controller.retain(sessionId, id, signal)) {
+        if (frame?.type !== 'retained') {
+          throw Object.assign(new Error('terminal retain yielded an unexpected frame'), { code: 'internal' })
+        }
+        if (!acknowledged) {
+          acknowledged = true
+          ready.resolve()
+        }
+      }
+      if (!acknowledged) {
+        throw Object.assign(new Error('terminal retain ended without acknowledgement'), { code: 'terminal/unavailable' })
+      }
+    } catch (error) {
+      ready.reject(error)
+      throw error
+    }
+  })()
+  return { ready: ready.promise, done }
+}
+
+function sendTerminalInput(attachment, command) {
+  const sequence = ++attachment.nextSeq
+  const done = Promise.withResolvers()
+  attachment.acks.set(sequence, done)
+  try {
+    attachment.send({ ...command, sequence })
+  } catch (error) {
+    attachment.acks.delete(sequence)
+    throw error
+  }
+  return done.promise
+}
+
+function failAttachment(attachment, error) {
+  attachment.ready.reject(error)
+  for (const waiter of attachment.acks.values()) waiter.reject(error)
+  attachment.acks.clear()
+}
+
+/**
+ * Host shell on the desktop machine (`terminalController`). Remote PTY is useful
+ * on the phone; only local-app/editor launchers stay hidden.
+ *
+ * Desktop `TerminalController` (0.2.1-alpha.5+) exposes `retain` / `attach`, not
+ * `follow` / `write` / `resize`. Pocket `terminal.follow` still returns
+ * `{subId, attachmentId}` immediately; frames arrive as `{ev:"terminal"}`.
+ * Write/resize ride the attach uplink as sequenced `{type:'write'|'resize'}`.
+ * Cancel with the existing `unfollow {subId}` (shared abort map on the WS client).
+ */
+export function terminalOps(terminalController, agents) {
+  const attachments = new Map()
+  const requireAttachment = (a) => {
+    if (!str(a.id) || !str(a.attachmentId)) throw bad('sessionId, id, attachmentId required')
+    const attachment = attachments.get(a.attachmentId)
+    if (attachment === undefined || attachment.sessionId !== a.sessionId || attachment.id !== a.id) {
+      throw Object.assign(new Error('terminal attachment is not attached'), { code: 'terminal/unavailable' })
+    }
+    return attachment
+  }
+  return {
+    'terminal.list': (a) => {
+      if (!str(a.sessionId)) throw bad('sessionId required')
+      return { terminals: terminalController.list(a.sessionId) ?? [], platform: process.platform }
+    },
+    'terminal.create': async (a, signal) => {
+      const agent = agentOf(agents, a.sessionId)
+      const id = str(a.id) ? a.id : randomUUID().replace(/-/g, '').slice(0, 16)
+      const cols = Number.isSafeInteger(a.cols) ? a.cols : 80
+      const rows = Number.isSafeInteger(a.rows) ? a.rows : 24
+      const info = await terminalController.create(agent, {
+        id, cols, rows,
+        ...(str(a.shellPath) ? { shellPath: a.shellPath } : {}),
+      }, signal)
+      return { terminal: info, platform: process.platform }
+    },
+    'terminal.write': async (a) => {
+      agentOf(agents, a.sessionId)
+      if (typeof a.data !== 'string') throw bad('sessionId, id, attachmentId, data required')
+      const attachment = requireAttachment(a)
+      await attachment.ready.promise
+      await sendTerminalInput(attachment, { type: 'write', data: a.data })
+      return { accepted: true }
+    },
+    'terminal.resize': async (a) => {
+      agentOf(agents, a.sessionId)
+      const attachment = requireAttachment(a)
+      const cols = Number.isSafeInteger(a.cols) ? a.cols : 80
+      const rows = Number.isSafeInteger(a.rows) ? a.rows : 24
+      await attachment.ready.promise
+      await sendTerminalInput(attachment, { type: 'resize', cols, rows })
+      return { accepted: true }
+    },
+    'terminal.close': async (a) => {
+      const agent = agentOf(agents, a.sessionId)
+      if (!str(a.id)) throw bad('id required')
+      await terminalController.close(agent, a.id)
+      return { closed: true }
+    },
+    'terminal.follow': async (a, _signal, client) => {
+      const agent = agentOf(agents, a.sessionId)
+      if (!str(a.id)) throw bad('id required')
+      if (!client?.subs || typeof client.push !== 'function') {
+        throw Object.assign(new Error('terminal.follow requires a live pocket client'), { code: 'internal' })
+      }
+      const attachmentId = str(a.attachmentId) ? a.attachmentId : randomUUID().replace(/-/g, '').slice(0, 16)
+      const subId = `t${client.nextSub++}`
+      const ac = new AbortController()
+      const uplink = createTerminalUplink()
+      const attachment = {
+        sessionId: a.sessionId,
+        id: a.id,
+        nextSeq: 0,
+        acks: new Map(),
+        send: (item) => uplink.push(item),
+        ready: Promise.withResolvers(),
+      }
+      attachment.ready.promise.catch(() => {})
+      attachments.set(attachmentId, attachment)
+      client.subs.set(subId, ac)
+      const hold = startRetain(terminalController, a.sessionId, a.id, ac.signal)
+      void (async () => {
+        try {
+          await hold.ready
+          ac.signal.throwIfAborted()
+          const stream = attachWithUplink(terminalController, agent, a.id, ac.signal, uplink)
+          attachment.ready.resolve()
+          for await (const frame of stream) {
+            if (ac.signal.aborted) break
+            if (frame?.type === 'ack') {
+              const waiter = attachment.acks.get(frame.sequence)
+              if (waiter === undefined) {
+                throw Object.assign(new Error('terminal input acknowledgement is out of order'), { code: 'internal' })
+              }
+              attachment.acks.delete(frame.sequence)
+              if (frame.refusal !== undefined) {
+                waiter.reject(Object.assign(new Error(`terminal input refused: ${frame.refusal}`), {
+                  code: 'terminal/control-unavailable',
+                  details: { reason: frame.refusal },
+                }))
+              } else {
+                waiter.resolve()
+              }
+              continue
+            }
+            client.push({ ev: 'terminal', subId, frame })
+          }
+          if (!ac.signal.aborted) client.push({ ev: 'terminal.end', subId })
+        } catch (error) {
+          failAttachment(attachment, error)
+          if (!ac.signal.aborted) {
+            client.push({
+              ev: 'terminal.error', subId,
+              error: { code: error?.code ?? 'internal', message: String(error?.message ?? error) },
+            })
+          }
+        } finally {
+          ac.abort()
+          uplink.close()
+          failAttachment(attachment, Object.assign(new Error('terminal attachment is closed'), { code: 'terminal/unavailable' }))
+          attachments.delete(attachmentId)
+          client.subs.delete(subId)
+          await hold.done.catch(() => {})
+        }
+      })()
+      return { subId, attachmentId }
+    },
+  }
+}
+
+/**
+ * Background jobs roster for one session. Host `job.list` is a stream; we take
+ * the first `rows` frame then abort (whole-set replacement).
+ */
+export function jobsOps(jobController) {
+  return {
+    'jobs.follow': (a, _signal, client) => {
+      if (!str(a.sessionId) || !str(a.jobId)) throw bad('sessionId and jobId required')
+      if (a.from !== undefined && (!Number.isSafeInteger(a.from) || a.from < 0)) throw bad('invalid output offset')
+      const subId = `j${client.nextSub++}`
+      const ac = new AbortController()
+      client.subs.set(subId, ac)
+      void (async () => {
+        try {
+          for await (const frame of jobController.follow(a, ac.signal)) {
+            if (ac.signal.aborted) break
+            client.push({ ev: 'job', subId, frame })
+          }
+          if (!ac.signal.aborted) client.push({ ev: 'job.end', subId })
+        } catch (error) {
+          if (!ac.signal.aborted) client.push({ ev: 'job.error', subId, error: { code: error?.code ?? 'internal', message: String(error?.message ?? error) } })
+        } finally { client.subs.delete(subId) }
+      })()
+      return { subId }
+    },
+    'jobs.list': async (a, signal) => {
+      if (!str(a.sessionId)) throw bad('sessionId required')
+      const ac = new AbortController()
+      const onAbort = () => ac.abort()
+      signal?.addEventListener?.('abort', onAbort, { once: true })
+      const unavailable = (message, cause) => Object.assign(new Error(message), {
+        code: 'jobs/unavailable',
+        ...(cause === undefined ? {} : { cause }),
+      })
+      let jobs
+      try {
+        if (signal?.aborted) throw unavailable('jobs list timed out or was aborted')
+        for await (const frame of jobController.list({ sessionId: a.sessionId }, ac.signal)) {
+          if (signal?.aborted) throw unavailable('jobs list timed out or was aborted')
+          if (frame?.type === 'rows') {
+            jobs = Array.isArray(frame.jobs) ? frame.jobs : []
+            ac.abort()
+            break
+          }
+        }
+      } catch (error) {
+        if (jobs !== undefined) {
+          // Roster already captured; aborting the watch is the stop condition.
+        } else if (error?.code === 'jobs/unavailable') {
+          throw error
+        } else if (signal?.aborted) {
+          throw unavailable('jobs list timed out or was aborted', error)
+        } else {
+          throw error
+        }
+      } finally {
+        signal?.removeEventListener?.('abort', onAbort)
+        if (!ac.signal.aborted) ac.abort()
+      }
+      if (jobs === undefined) throw unavailable('jobs list ended without a rows frame')
+      return { jobs }
+    },
+    'jobs.kill': (a) => {
+      if (!str(a.sessionId) || !str(a.jobId)) throw bad('sessionId and jobId required')
+      return jobController.kill({ sessionId: a.sessionId, jobId: a.jobId })
+    },
+  }
+}
+
+/**
+ * Session log export: walk `sessionController.page` into JSONL and ZIP it
+ * (single entry). Matches desktop download intent without Host cookie auth.
+ */
+export function exportOps(sc, { zipSync, strToU8 } = {}) {
+  if (typeof zipSync !== 'function' || typeof strToU8 !== 'function') {
+    throw new Error('exportOps requires fflate zipSync and strToU8')
+  }
+  return {
+    'session.export': async (a, signal) => {
+      if (!str(a.sessionId)) throw bad('sessionId required')
+      const sessionId = a.sessionId
+      const includeDescendants = a.includeDescendants !== false
+      const lines = []
+      let throughSeq = Number.MAX_SAFE_INTEGER
+      let guard = 0
+      while (guard++ < 200) {
+        signal?.throwIfAborted?.()
+        const page = await sc.page({
+          address: { kind: 'session', sessionId },
+          throughSeq,
+          maxMessages: 200,
+        }, signal)
+        const records = page?.records ?? []
+        for (const rec of records) lines.push(JSON.stringify(rec))
+        if (!page?.hasMore || records.length === 0) break
+        const seqs = records.map((r) => r?.event?.seq).filter((n) => Number.isSafeInteger(n))
+        const min = seqs.length ? Math.min(...seqs) : null
+        if (min === null || min <= 0) break
+        throughSeq = min - 1
+      }
+      const body = `${lines.join('\n')}${lines.length ? '\n' : ''}`
+      const filename = `dsh-session-${sessionId.replace(/[^A-Za-z0-9._-]+/g, '_').slice(0, 80)}.zip`
+      const zipped = zipSync({ [`${sessionId}.jsonl`]: strToU8(body) }, { level: 6 })
+      return {
+        filename,
+        mediaType: 'application/zip',
+        includeDescendants,
+        data: Buffer.from(zipped).toString('base64'),
+      }
+    },
+  }
+}

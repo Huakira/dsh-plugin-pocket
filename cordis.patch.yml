@@ -1,0 +1,6 @@
+- insert:
+    - id: dsh-pocket
+      name: dsh-plugin-pocket
+      config:
+        host: 127.0.0.1
+        port: 7690
